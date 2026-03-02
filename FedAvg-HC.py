@@ -4,7 +4,6 @@ from collections import Counter
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -69,8 +68,8 @@ def dirichlet_partition(y_array, num_clients, alpha=0.5, seed=42,
         RuntimeError: If the constraint cannot be satisfied after 100 retries.
     """
     np.random.seed(seed)
-    class_labels  = np.unique(y_array)
-    idx_by_class  = {lbl: np.where(y_array == lbl)[0] for lbl in class_labels}
+    class_labels = np.unique(y_array)
+    idx_by_class = {lbl: np.where(y_array == lbl)[0] for lbl in class_labels}
 
     for retry in range(1, 101):
         client_indices = [[] for _ in range(num_clients)]
@@ -146,27 +145,28 @@ def print_device_label_distribution(client_data):
 
 def logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho):
     """
-    Edge-level subproblem: gradient-descent minimisation of the augmented
-    Lagrangian w.r.t. y[i][j] for E − 1 local steps.
+    Edge-level local update: pure gradient descent on the logistic loss
+    for E − 1 steps (no dual / penalty terms, consistent with FedAvg-HC).
 
-    Augmented Lagrangian (edge part):
-        L_ij = (1/d) Σ log(1 + exp(−b_k · a_k^T y_ij))
-               − μ_ij^T (x_i − y_ij)
-               + (ρ/2) ‖x_i − y_ij‖²
+    Local objective:
+        f_ij(y_ij) = (1/d) Σ_k log(1 + exp(−b_k · a_k^T y_ij))
 
     Args:
-        x   (list[np.ndarray]): Fog-level parameters x[i].
+        x   (list[np.ndarray]): Fog-level parameters x[i] (not used here,
+                                kept for interface consistency).
         y   (list[list[np.ndarray]]): Edge-level parameters y[i][j].
         i, j (int): Fog and edge indices.
-        mu  (list[list[np.ndarray]]): Fog-edge dual variables.
+        mu  (list[list[np.ndarray]]): Dual variables (not used in FedAvg-HC,
+                                      kept for interface consistency).
         d   (int): Total training samples (loss normalisation denominator).
         alpha (float): Gradient-descent step size.
-        rho (float):  penalty parameter.
+        rho (float): Penalty parameter (not used in FedAvg-HC,
+                     kept for interface consistency).
 
     Returns:
-        F_total (float): Augmented Lagrangian value after update.
+        F_total (float): Local logistic loss (no augmented terms).
         loss_avg (float): Average logistic loss over local data.
-        dual_residual (np.ndarray): y_new − y_old (measures dual change).
+        dual_residual (np.ndarray): y_new − y_old.
     """
     updated_y = copy.deepcopy(y[i][j])
     a, b      = client_data[i, j]["a"], client_data[i, j]["b"]
@@ -179,83 +179,76 @@ def logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho):
         grad_logit = -b * np.exp(-np.logaddexp(0, scores))   # (n_samples,)
         grad_f     = (a.T @ grad_logit) / d                  # normalised
 
-        # Gradient of augmented Lagrangian penalty terms
-        grad_aug = -mu[i][j] - rho * (x[i] - updated_y)
-
-        # Gradient-descent update
-        updated_y -= alpha * (grad_f + grad_aug)
+        # FedAvg-HC: no dual correction term (grad_aug = 0)
+        updated_y -= alpha * grad_f
 
     dual_residual = updated_y - y[i][j]
     y[i][j]       = updated_y
 
-    # Evaluate augmented Lagrangian at the final iterate
+    # Evaluate local logistic loss at the final iterate (no augmented terms)
     scores   = b * (a @ y[i][j])
     losses   = np.logaddexp(0, -scores)
     loss_avg = losses.sum() / d
-    lag_term = (mu[i][j] @ (x[i] - y[i][j])
-                + rho / 2 * np.sum((x[i] - y[i][j]) ** 2))
-    F_total  = loss_avg + lag_term
+    F_total  = loss_avg   # lag_term = 0 in FedAvg-HC
 
     return F_total, loss_avg, dual_residual
 
 
 def analytical_solution_fog_i(w, x, y, i, mu_0, mu, rho):
     """
-    Fog-level subproblem: closed-form update for x[i].
+    Fog-level aggregation: simple average of the edge models and the
+    current cloud model (no dual correction, consistent with FedAvg-HC).
 
-    Setting ∂L / ∂x_i = 0 yields:
-        x_i ← (1 / (m_i + 1)) · [w + Σ_j y_ij + (1/ρ)(μ_0i − Σ_j μ_ij)]
+    Update rule:
+        x_i ← (1 / (m_i + 1)) · [w + Σ_j y_ij]
 
     Args:
         w    (np.ndarray): Current global cloud model.
         x    (list[np.ndarray]): Fog-level parameters (updated in-place).
         y    (list[list[np.ndarray]]): Edge-level parameters.
         i    (int): Fog node index.
-        mu_0 (list[np.ndarray]): Cloud-fog dual variables.
-        mu   (list[list[np.ndarray]]): Fog-edge dual variables.
-        rho  (float):  penalty parameter.
+        mu_0 (list[np.ndarray]): Cloud-fog dual variables (not used in
+                                 FedAvg-HC, kept for interface consistency).
+        mu   (list[list[np.ndarray]]): Fog-edge dual variables (not used in
+                                       FedAvg-HC, kept for interface consistency).
+        rho  (float): Penalty parameter (not used in FedAvg-HC,
+                      kept for interface consistency).
 
     Returns:
-        A_i (float): Local augmented Lagrangian contribution for fog i.
+        A_i (float): Placeholder aggregation value (0 in FedAvg-HC).
         dual_residual_i (np.ndarray): x_new − x_old.
     """
-    x_new = (1 / (m_i + 1)) * (
-        w + sum(y[i]) + (1 / rho) * (mu_0[i] - sum(mu[i]))
-    )
+    x_new           = (1 / (m_i + 1)) * (w + sum(y[i]))
     dual_residual_i = x_new - x[i]
     x[i]            = copy.deepcopy(x_new)
 
-    # Augmented Lagrangian contributions for fog node i
-    A_i = (mu_0[i] @ (w - x[i])
-           + rho / 2 * np.sum((w - x[i]) ** 2))
-    for j in range(m_i):
-        A_i += (mu[i][j] @ (x[i] - y[i][j])
-                + rho / 2 * np.sum((x[i] - y[i][j]) ** 2))
+    # FedAvg-HC: no augmented Lagrangian penalty terms
+    A_i = 0.0
 
     return A_i, dual_residual_i
 
 
 def analytical_solution_cloud():
     """
-    Cloud-level subproblem: closed-form update for global model w.
+    Cloud-level aggregation: simple average of all fog models
+    (no dual correction, consistent with FedAvg-HC).
 
-    Setting ∂L / ∂w = 0 yields:
-        w ← (1 / n) · [Σ_i x_i − (1/ρ) Σ_i μ_0i]
+    Update rule:
+        w ← (1 / n) · Σ_i x_i
 
-    Uses the global variables w, x, mu_0, n, rho (defined in __main__).
+    Uses the global variables w, x, n (defined in __main__).
 
     Returns:
-        A_0 (float): Cloud-level augmented Lagrangian value.
+        A_0 (float): Placeholder aggregation value (0 in FedAvg-HC).
         dual_residual (np.ndarray): w_new − w_old.
     """
-    w_new         = (1 / n) * (sum(x) - (1 / rho) * sum(mu_0))
+    w_new         = (1 / n) * sum(x)
     dual_residual = w_new - w
     w[:]          = copy.deepcopy(w_new)   # in-place update propagates to callers
 
-    A_0 = sum(
-        mu_0[i] @ (w - x[i]) + rho / 2 * np.sum((w - x[i]) ** 2)
-        for i in range(n)
-    )
+    # FedAvg-HC: no augmented Lagrangian penalty terms
+    A_0 = 0.0
+
     return A_0, dual_residual
 
 
@@ -278,16 +271,16 @@ def predict(X, w):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5.  Main: Training
+# 5.  Main: FedAvg-HC Training
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     np.random.seed(42)
 
     # ── Topology ──────────────────────────────────────────────────────────────
-    n   = 10          # number of fog nodes
-    m   = 10          # total edge devices  (must be divisible by n)
-    m_i = m // n      # edge devices per fog node
+    n   = 10           # number of fog nodes
+    m   = 100          # total edge devices (must be divisible by n)
+    m_i = m // n       # edge devices per fog node
 
     # ── Dataset dimensions ────────────────────────────────────────────────────
     d = X_train.shape[0]   # total training samples
@@ -310,13 +303,13 @@ if __name__ == "__main__":
     x = [np.zeros(p) for _ in range(n)]                         # fog models
     y = [[np.zeros(p) for _ in range(m_i)] for _ in range(n)]   # edge models
 
-    # ── Dual variable initialisation ──────────────────────────────────────────
-    mu_0 = [np.zeros(p) for _ in range(n)]                      # cloud-fog multipliers
-    mu   = [[np.zeros(p) for _ in range(m_i)] for _ in range(n)]  # fog-edge multipliers
+    # ── Dual variable initialisation (unused in FedAvg-HC, kept for consistency)
+    mu_0 = [np.zeros(p) for _ in range(n)]                           # cloud-fog multipliers
+    mu   = [[np.zeros(p) for _ in range(m_i)] for _ in range(n)]     # fog-edge multipliers
 
     # ── Convergence bookkeeping ───────────────────────────────────────────────
-    dual_residual = {}
-    pri_residual  = {}
+    dual_residual          = {}
+    pri_residual           = {}
     F_values               = []
     avg_loss               = []
     avg_accuracies_history = []
@@ -325,20 +318,20 @@ if __name__ == "__main__":
     # ── Hyperparameters ───────────────────────────────────────────────────────
     eps_pri  = 1e-5    # primal residual convergence tolerance
     eps_dual = 1e-5    # dual residual convergence tolerance
-    v_max    = 1       # inner consensus iterations per outer  round
-    rho      = 1.0     #  penalty / step-size parameter
+    v_max    = 1       # inner iterations per outer communication round
+    rho      = 1.0     # penalty parameter (unused in FedAvg-HC, kept for consistency)
     alpha    = 0.001   # edge gradient-descent step size
-    E        = 10      # local gradient steps per edge update
+    E        = 10     # local gradient steps per edge update
     max_iter = 301     # hard cap on total inner iterations
 
     N_iter = 0         # global iteration counter
 
     # ── Logging setup ─────────────────────────────────────────────────────────
-    logger   = logging.getLogger("logger")
+    logger = logging.getLogger("logger")
     logger.setLevel(logging.DEBUG)
 
     log_path = (
-        f"./log/HC_E{E}_rho{rho}_n{n}_m{m}_mi{m_i}"
+        f"./log/FedAvg-HC_E{E}_rho{rho}_n{n}_m{m}_mi{m_i}"
         f"_vmax{v_max}_epspri{eps_pri}_epsdual{eps_dual}_alpha{alpha}.log"
     )
     fh = logging.FileHandler(log_path, "w")
@@ -350,35 +343,32 @@ if __name__ == "__main__":
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-    # ── main loop ────────────────────────────────────────────────────────
+    # ── FedAvg-HC main loop ───────────────────────────────────────────────────
     for k in range(2001):
         v      = 0
-        temp_1 = 0   # number of dual variables that have converged
+        temp_1 = 0   # number of dual residuals that have converged
 
-        # Inner loop: run up to v_max primal updates before a dual step
+        # Inner loop: run up to v_max local update rounds before aggregation
         while v < v_max:
             N_iter += 1
             v      += 1
             F, loss = [], []
 
-            # Step 1 – Edge update (gradient descent on augmented Lagrangian)
+            # Step 1 – Edge update: local gradient descent (no dual correction)
             for i in range(n):
                 for j in range(m_i):
                     F_ij, loss_ij, dual_residual[(i, j)] = \
                         logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho)
-                    # Alternative: L-BFGS-B solver (comment line above, uncomment below)
-                    # F_ij, loss_ij, dual_residual[(i, j)] = \
-                    #     logistic_lbfgs_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho)
                     F.append(F_ij)
                     loss.append(loss_ij)
 
-            # Step 2 – Fog update (closed-form)
+            # Step 2 – Fog aggregation: average edge models with cloud model
             for i in range(n):
                 F_i, dual_residual[i] = \
                     analytical_solution_fog_i(w, x, y, i, mu_0, mu, rho)
                 F.append(F_i)
 
-            # Step 3 – Cloud update (closed-form)
+            # Step 3 – Cloud aggregation: average all fog models
             F_0, dual_residual[-1] = analytical_solution_cloud()
             F.append(F_0)
 
@@ -416,17 +406,15 @@ if __name__ == "__main__":
                 logger.info(f"Dual converged: {temp_1}/{len(dual_residual)} variables below threshold.")
                 break
 
-        # ── Dual variable update (multiplier step) ────────────────────────────
-        # Fog-edge multipliers
+        # ── Primal residual computation (no multiplier update in FedAvg-HC) ──
         for i in range(n):
             for j in range(m_i):
                 pri_residual[i, j] = x[i] - y[i][j]
-                mu[i][j]          += rho * pri_residual[i, j]
+                # mu[i][j] += rho * pri_residual[i, j]   # disabled in FedAvg-HC
 
-        # Cloud-fog multipliers
         for i in range(n):
             pri_residual[i] = w - x[i]
-            mu_0[i]        += rho * pri_residual[i]
+            # mu_0[i] += rho * pri_residual[i]           # disabled in FedAvg-HC
 
         if N_iter == max_iter:
             break
@@ -456,19 +444,19 @@ if __name__ == "__main__":
     })
 
     csv_path = (
-        f"./csv/HC_E{E}_rho{rho}_n{n}_m{m}_mi{m_i}"
+        f"./csv/FedAvg-HC_E{E}_rho{rho}_n{n}_m{m}_mi{m_i}"
         f"_vmax{v_max}_iter{N_iter}_epspri{eps_pri}_epsdual{eps_dual}_alpha{alpha}.csv"
     )
     results_df.to_csv(csv_path, index=False)
 
     # ── Final summary ─────────────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info(f"Fog nodes (n):           {n}")
+    logger.info(f"Fog nodes (n):              {n}")
     logger.info(f"Edge devices per fog (m_i): {m_i}")
-    logger.info(f"Local steps (E):         {E}")
-    logger.info(f"Step size (alpha):       {alpha}")
-    logger.info(f"Total iterations:        {N_iter}")
-    logger.info(f"v_max:                   {v_max}")
-    logger.info(f"Mean test accuracy:      {mean_acc:.8f}")
-    logger.info(f"Std  test accuracy:      {std_acc:.8f}")
-    logger.info(f"Global model w:          {w}")
+    logger.info(f"Local steps (E):            {E}")
+    logger.info(f"Step size (alpha):          {alpha}")
+    logger.info(f"Total iterations:           {N_iter}")
+    logger.info(f"v_max:                      {v_max}")
+    logger.info(f"Mean test accuracy:         {mean_acc:.8f}")
+    logger.info(f"Std  test accuracy:         {std_acc:.8f}")
+    logger.info(f"Global model w:             {w}")

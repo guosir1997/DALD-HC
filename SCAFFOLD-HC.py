@@ -1,563 +1,516 @@
-# 这是一个示例 Python 脚本。
 import copy
 import logging
-# 按 Shift+F10 执行或将其替换为您的代码。
-# 按 双击 Shift 在所有地方搜索类、文件、工具窗口、操作和设置。
-
 from collections import Counter
-import pandas as pd
+
 import numpy as np
-from matplotlib import pyplot as plt
-from scipy.optimize import minimize
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-# from sklearn.metrics import classification_report, accuracy_score
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  Data Loading & Preprocessing
+# ──────────────────────────────────────────────────────────────────────────────
 
-df = pd.read_csv("./datasets/processed_dataset_time_2_cos&sin_binary_low&medium.csv")  # 二分类
+# Binary classification dataset (labels encoded as ±1)
+df = pd.read_csv("./datasets/processed_dataset_time_2_cos&sin_binary_low&medium.csv")
 
-# 特征列（除了目标列 'Efficiency_Status'）
-X = df.drop(columns=['Efficiency_Status'])
+X = df.drop(columns=["Efficiency_Status"])
+y = df["Efficiency_Status"]
 
-# 目标列（多类别分类：High, Medium, Low，已编码为 0, 1, 2）
-y = df['Efficiency_Status']
+feature_names = X.columns  # preserve column names before array conversion
 
-# 假设 df 是你的原始数据框
-X = df.drop('Efficiency_Status', axis=1)
-
-# 🔑 先保存列名
-feature_names = X.columns
-
-# 划分训练集和测试集
+# Stratified split to maintain class balance in both sets
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 
 y_train = y_train.values
-y_test = y_test.values
+y_test  = y_test.values
 
-# 标准化特征数据
-scaler = StandardScaler()
+# Standardize: fit on train only, then apply the same transform to test
+scaler  = StandardScaler()
 X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
+X_test  = scaler.transform(X_test)
 
-#  使用 feature_names 构造 DataFrame
+# Named DataFrames kept for analysis / debugging purposes
 X_train_df = pd.DataFrame(X_train, columns=feature_names)
-X_test_df = pd.DataFrame(X_test, columns=feature_names)
+X_test_df  = pd.DataFrame(X_test,  columns=feature_names)
 
-X_train = np.c_[np.ones(X_train.shape[0]), X_train]  # 给 X_train 添加偏置项
-X_test = np.c_[np.ones(X_test.shape[0]), X_test]  # 给 X_test 添加偏置项
-
-
-# def dirichlet_partition(y_array, num_clients, alpha=0.5, seed=42):
-#     """
-#     基于 Dirichlet 分布将标签 y_array 分配到 num_clients 个客户端中。
-#     """
-#     np.random.seed(seed)
-#     class_labels = np.unique(y_array)
-#     idx_by_class = {label: np.where(y_array == label)[0] for label in class_labels}
-#     client_indices = [[] for _ in range(num_clients)]
-#
-#     for label in class_labels:
-#         indices = idx_by_class[label]
-#         np.random.shuffle(indices)
-#         proportions = np.random.dirichlet([alpha] * num_clients)
-#         proportions = (np.cumsum(proportions) * len(indices)).astype(int)[:-1]
-#         splits = np.split(indices, proportions)
-#         for i, split in enumerate(splits):
-#             client_indices[i].extend(split)
-#
-#     return client_indices
+# Prepend bias column (column of ones) so weights include intercept
+X_train = np.c_[np.ones(X_train.shape[0]), X_train]
+X_test  = np.c_[np.ones(X_test.shape[0]),  X_test]
 
 
-def dirichlet_partition(y_array, num_clients, alpha=0.5, seed=42, min_samples_per_client=1):
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  Non-IID Data Partitioning (Dirichlet)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def dirichlet_partition(y_array, num_clients, alpha=0.5, seed=42,
+                        min_samples_per_client=1):
     """
-    Dirichlet 非IID划分，并保证每个客户端最少 min_samples_per_client 条数据。
+    Partition sample indices across clients using a Dirichlet distribution.
+
+    A small alpha produces highly heterogeneous (non-IID) splits;
+    alpha → ∞ approaches a uniform (IID) split.
+
+    Args:
+        y_array (np.ndarray): Label array of the full dataset.
+        num_clients (int): Number of clients to distribute data across.
+        alpha (float): Dirichlet concentration parameter.
+        seed (int): Random seed for reproducibility.
+        min_samples_per_client (int): Minimum samples guaranteed per client.
+
+    Returns:
+        list[list[int]]: Per-client lists of sample indices.
+
+    Raises:
+        RuntimeError: If the constraint cannot be satisfied after 100 retries.
     """
     np.random.seed(seed)
     class_labels = np.unique(y_array)
-    idx_by_class = {label: np.where(y_array == label)[0] for label in class_labels}
+    idx_by_class = {lbl: np.where(y_array == lbl)[0] for lbl in class_labels}
 
-    success = False
-    retry = 0
-    while not success:
-        retry += 1
+    for retry in range(1, 101):
         client_indices = [[] for _ in range(num_clients)]
 
         for label in class_labels:
-            indices = idx_by_class[label]
+            indices     = idx_by_class[label].copy()
             np.random.shuffle(indices)
             proportions = np.random.dirichlet([alpha] * num_clients)
-            proportions = (np.cumsum(proportions) * len(indices)).astype(int)[:-1]
-            splits = np.split(indices, proportions)
-            for i, split in enumerate(splits):
-                client_indices[i].extend(split)
+            cuts        = (np.cumsum(proportions) * len(indices)).astype(int)[:-1]
+            for cid, split in enumerate(np.split(indices, cuts)):
+                client_indices[cid].extend(split.tolist())
 
-        # 检查是否所有客户端都满足最小样本数要求
-        client_sizes = [len(c) for c in client_indices]
-        if min(client_sizes) >= min_samples_per_client:
-            success = True
-        elif retry > 100:
-            raise RuntimeError("无法满足所有客户端最小样本要求，请尝试调大 alpha 或减少 client 数量。")
+        if min(len(c) for c in client_indices) >= min_samples_per_client:
+            return client_indices
 
-    return client_indices
+    raise RuntimeError(
+        "Cannot satisfy min_samples_per_client after 100 retries. "
+        "Try increasing alpha or reducing num_clients."
+    )
 
 
 def split_data(X_array, y_array, num_fog, num_edge, alpha=0.5, seed=42):
     """
-    将数据划分成 m = num_fog * num_edge 台设备，再划分到 n 个工厂中。
+    Distribute data across a two-tier hierarchy of fog nodes and edge devices.
 
-    参数：
-        X_array: np.ndarray，特征数据，第10列为 Machine_ID（可以忽略）
-        y_array: np.ndarray，标签数据
-        num_fog: 工厂数量（n）
-        num_edge: 每个工厂的设备数（m_i）
-        alpha: Dirichlet 分布参数，越小越 Non-IID
-        seed: 随机种子，确保可重复性
+    Total clients = num_fog × num_edge.
+    Client index cid maps to (fog_id = cid // num_edge, edge_id = cid % num_edge).
 
-    返回：
-        client_data_[(i, j)] = {'a': X_sub, 'b': y_sub}
+    Args:
+        X_array (np.ndarray): Feature matrix (with bias column prepended).
+        y_array (np.ndarray): Label array (±1).
+        num_fog (int): Number of fog nodes.
+        num_edge (int): Edge devices per fog node.
+        alpha (float): Dirichlet heterogeneity parameter.
+        seed (int): Random seed.
+
+    Returns:
+        dict: {(fog_id, edge_id): {'a': X_subset, 'b': y_subset}}
     """
-    assert X_array.shape[0] == y_array.shape[0], "X 和 y 的样本数必须一致"
+    assert X_array.shape[0] == y_array.shape[0], \
+        "X and y must have the same number of samples."
 
-    total_clients = num_fog * num_edge
-    client_indices = dirichlet_partition(y_array, total_clients, alpha, seed)
+    client_indices = dirichlet_partition(y_array, num_fog * num_edge, alpha, seed)
 
-    client_data_ = dict()
+    client_data_ = {}
     for cid, indices in enumerate(client_indices):
-        fog_id = cid // num_edge
-        edge_id = cid % num_edge
-        X_sub = X_array[indices]
-        y_sub = y_array[indices]
-        client_data_[(fog_id, edge_id)] = {'a': X_sub, 'b': y_sub}
-
+        fog_id  = cid // num_edge
+        edge_id = cid %  num_edge
+        client_data_[(fog_id, edge_id)] = {
+            "a": X_array[indices],
+            "b": y_array[indices],
+        }
     return client_data_
 
 
 def print_device_label_distribution(client_data):
-    print(f"{'工厂':<5} {'设备':<5} | {'标签分布':<30} | {'样本总数':<10} | {'正类比例':<10}")
-    print("-" * 80)
+    """Print a summary table of label counts and positive-class ratio per device."""
+    print(f"{'Fog':<5} {'Edge':<5} | {'Label Distribution':<28} | {'Total':<8} | {'Pos Ratio'}")
+    print("-" * 72)
     for (i, j), data in sorted(client_data.items()):
-        labels = data['b']
-        counter = Counter(labels)
-        total = len(labels)
-        pos = counter[1] if 1 in counter else 0
-        neg = counter[-1] if -1 in counter else 0
+        labels    = data["b"]
+        counter   = Counter(labels)
+        total     = len(labels)
+        pos       = counter.get(1,  0)
+        neg       = counter.get(-1, 0)
         pos_ratio = pos / total if total > 0 else 0
-        print(f"{i:<5} {j:<5} | {-1}: {neg:<5}, 1: {pos:<5}       | {total:<10} | {pos_ratio:.2%}")
+        print(f"{i:<5} {j:<5} | -1: {neg:<6} 1: {pos:<6}         | {total:<8} | {pos_ratio:.2%}")
 
 
-#
-# def logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho):
-#     # 计算所有样本的分数 b_ij * (a_ij^T y_ij)
-#     scores = client_data[i, j]['b'] * np.dot(client_data[i, j]['a'], y[i][j])
-#
-#     # 计算1/d * f_i 梯度：梯度 = sum( (-b_ij * X_i) / (1 + exp(b_ij * a_ij^T y_ij)) ) / d
-#     grad_coeff = -client_data[i, j]['b'] * np.exp(-np.logaddexp(0, scores))  # shape: (n_samples,)
-#     grad_1 = np.dot(client_data[i, j]['a'].T, grad_coeff) / d  # 归一化梯度
-#
-#     # 计算 松弛项梯度
-#     # -μ_ij^k-ρ(x_i^(k,v-1)-y_ij)
-#     grad_2 = - mu[i][j] - rho * (x[i] - y[i][j])
-#     grad = grad_1 + grad_2
-#
-#     y_i_j_temp = y[i][j] - alpha * grad
-#
-#     dual_residual_i_j = y_i_j_temp - y[i][j]
-#
-#     y[i][j] = y_i_j_temp
-#
-#     # 计算局部增广拉格朗日函数
-#     # 计算1 / d * f_i:
-#     # 数值稳定地计算 log(1 + exp(-scores))
-#     losses = np.logaddexp(0, -scores)  # 等价于 log(1 + exp(-scores))
-#     average_loss = np.sum(losses) / d
-#
-#     # 添加增广增广松弛项
-#     A_ij = np.dot(mu[i][j], (x[i] - y[i][j])) + rho/2 * np.sum((x[i] - y[i][j]) ** 2)
-#
-#     F_i = average_loss + A_ij
-#
-#     return F_i, average_loss, dual_residual_i_j
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  Subproblem Solvers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho):
-    updated_y = copy.deepcopy(x[i])
+    """
+    Edge-level local update for SCAFFOLD-HC.
 
+    Each edge device starts from the current fog model x[i] and runs E − 1
+    steps of variance-corrected gradient descent.  At each step the raw
+    gradient is adjusted by the SCAFFOLD control variates:
+        g_corrected = grad_f − c_ij[i][j] + c_i[i]
+
+    where c_ij[i][j] is the local control variate (tracks the edge device's
+    gradient drift) and c_i[i] is the fog-level control variate (tracks the
+    fog node's aggregate gradient drift).  This correction eliminates the
+    client-drift bias caused by non-IID data and heterogeneous local steps.
+
+    After local training the edge control variate is updated as:
+        c_ij[i][j] ← −(1/E) · Σ_e grad_f_e
+
+    Local objective (before correction):
+        f_ij(y_ij) = (1/d) Σ_k log(1 + exp(−b_k · a_k^T y_ij))
+
+    Args:
+        x   (list[np.ndarray]): Fog-level parameters x[i]; used as the
+                                starting point for local updates.
+        y   (list[list[np.ndarray]]): Edge-level parameters y[i][j]
+                                      (updated in-place).
+        i, j (int): Fog and edge indices.
+        mu  (list[list[np.ndarray]]): Dual variables (unused in SCAFFOLD-HC,
+                                      kept for interface consistency).
+        d   (int): Total training samples (loss normalisation denominator).
+        alpha (float): Gradient-descent step size.
+        rho (float): Penalty parameter (unused in SCAFFOLD-HC,
+                     kept for interface consistency).
+
+    Returns:
+        F_total (float): Local logistic loss (no augmented terms).
+        loss_avg (float): Average logistic loss over local data.
+        dual_residual (np.ndarray): y_new − y_old.
+
+    Side effects:
+        Updates c_ij[i][j] with the new edge control variate.
+    """
+    # SCAFFOLD-HC: initialise local model from the fog model x[i]
+    updated_y      = copy.deepcopy(x[i])
+    a, b           = client_data[i, j]["a"], client_data[i, j]["b"]
     grad_total_list = []
 
-    for e in range(E - 1):
-        # Step 1: 计算逻辑回归分数：b * (a^T y)
-        scores = client_data[i, j]['b'] * np.dot(client_data[i, j]['a'], updated_y)
+    for _ in range(E - 1):
+        # Logistic scores: b · (a^T y)
+        scores = b * (a @ updated_y)
 
-        # Step 2: 计算逻辑损失梯度项
-        grad_logit = -client_data[i, j]['b'] * np.exp(-np.logaddexp(0, scores))  # shape: (n_samples,)
-        grad_f = np.dot(client_data[i, j]['a'].T, grad_logit) / d  # 标准化后梯度
+        # Gradient of logistic loss: ∂/∂y Σ log(1 + exp(−scores))
+        grad_logit = -b * np.exp(-np.logaddexp(0, scores))   # (n_samples,)
+        grad_f     = (a.T @ grad_logit) / d                  # normalised
 
-        # Step 3: 增广项梯度
-        # grad_aug = - mu[i][j] - rho * (x[i] - updated_y)
-        grad_aug = 0
+        # SCAFFOLD-HC: no dual penalty term (grad_aug = 0)
+        grad_total = grad_f
 
-        # Step 4: 合并梯度并更新 y
-        grad_total = grad_f + grad_aug
-
-        # 梯度下降
-        updated_y = updated_y - alpha * (grad_total - c_ij[i][j] + c_i[i])
+        # Variance-corrected gradient descent:
+        # subtract local control variate c_ij and add fog control variate c_i
+        updated_y -= alpha * (grad_total - c_ij[i][j] + c_i[i])
 
         grad_total_list.append(grad_total)
 
     dual_residual = updated_y - y[i][j]
 
-    c_ij[i][j] = - 1 / E * sum(grad_total_list)
+    # Update edge control variate: c_ij ← −(1/E) · Σ_e grad_f_e
+    c_ij[i][j] = -(1 / E) * sum(grad_total_list)
 
     y[i][j] = updated_y
 
-    # Step 5: 计算增广拉格朗日目标值
-    losses = np.logaddexp(0, -scores)
-    loss_avg = np.sum(losses) / d
-    # lag_term = np.dot(mu[i][j], (x[i] - y[i][j])) + rho / 2 * np.sum((x[i] - y[i][j]) ** 2)
-    lag_term = 0
-
-    F_total = loss_avg + lag_term
+    # Evaluate local logistic loss at the final iterate (no augmented terms)
+    scores   = b * (a @ y[i][j])
+    losses   = np.logaddexp(0, -scores)
+    loss_avg = losses.sum() / d
+    F_total  = loss_avg   # lag_term = 0 in SCAFFOLD-HC
 
     return F_total, loss_avg, dual_residual
 
 
-def logistic_third_part_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho):
-    # 从数据集中取出 a 和 b
-    a = client_data[i, j]['a']  # shape: (d, dim)
-    b = client_data[i, j]['b']  # shape: (d,)，±1标签
+def analytical_solution_fog_i(w, x, y, i, mu_0, mu, rho):
+    """
+    Fog-level aggregation for SCAFFOLD-HC.
 
-    scores = client_data[i, j]['b'] * np.dot(client_data[i, j]['a'], y[i][j])
+    Computes the fog model as the simple average of all edge models:
+        x_i ← (1 / m_i) · Σ_j y_ij
 
-    # 当前的 y_ij 向量
-    y_ij_init = copy.deepcopy(y[i][j])
+    Also updates the fog control variate as the average of edge control
+    variates:
+        c_i[i] ← (1 / m_i) · Σ_j c_ij[i][j]
 
-    # 定义目标函数
-    def objective(y_ij):
-        # 第一个项：逻辑损失
-        logits = b * np.dot(a, y_ij)
-        log_loss = np.mean(np.logaddexp(0, -logits))
+    Args:
+        w    (np.ndarray): Current global cloud model (unused here,
+                           kept for interface consistency).
+        x    (list[np.ndarray]): Fog-level parameters (updated in-place).
+        y    (list[list[np.ndarray]]): Edge-level parameters.
+        i    (int): Fog node index.
+        mu_0 (list[np.ndarray]): Cloud-fog dual variables (unused in
+                                 SCAFFOLD-HC, kept for interface consistency).
+        mu   (list[list[np.ndarray]]): Fog-edge dual variables (unused in
+                                       SCAFFOLD-HC, kept for interface consistency).
+        rho  (float): Penalty parameter (unused in SCAFFOLD-HC,
+                      kept for interface consistency).
 
-        # 第二项：线性乘子项
-        linear_term = np.dot(mu[i][j], x[i] - y_ij)
+    Returns:
+        A_i (float): Placeholder aggregation value (0 in SCAFFOLD-HC).
+        dual_residual_i (np.ndarray): x_new − x_old.
 
-        # 第三项：二次项
-        quad_term = (rho / 2) * np.linalg.norm(x[i] - y_ij) ** 2
+    Side effects:
+        Updates c_i[i] with the new fog control variate.
+    """
+    x_new           = (1 / m_i) * sum(y[i])
+    dual_residual_i = x_new - x[i]
+    x[i]            = copy.deepcopy(x_new)
 
-        return log_loss + linear_term + quad_term
+    # Update fog control variate: average of edge control variates
+    c_i[i] = (1 / m_i) * sum(c_ij[i])
 
-    # 可选：定义梯度（加速收敛）
-    def gradient(y_ij):
-        logits = b * np.dot(a, y_ij)
-        sigma = -b * np.exp(-np.logaddexp(0, logits))  # 逻辑回归梯度项
-        grad_log_loss = np.dot(a.T, sigma) / d
-
-        grad_linear = -mu[i][j]
-        grad_quad = -rho * (x[i] - y_ij)
-
-        return grad_log_loss + grad_linear + grad_quad
-
-    # 调用最优化器
-    result = minimize(
-        objective,
-        y_ij_init,
-        jac=gradient,  # 提供梯度更高效
-        method='L-BFGS-B'
-    )
-
-    # 更新 y 和 dual_residual
-    updated_y = result.x
-    dual_residual = updated_y - y[i][j]
-    y[i][j] = copy.deepcopy(updated_y)
-
-    # Step 5: 计算增广拉格朗日目标值
-    losses = np.logaddexp(0, -scores)
-    loss_avg = np.sum(losses) / d
-    lag_term = np.dot(mu[i][j], (x[i] - y[i][j])) + rho / 2 * np.sum((x[i] - y[i][j]) ** 2)
-
-    F_total = loss_avg + lag_term
-
-    return F_total, loss_avg, dual_residual
-
-
-def analytical_solution_2_fog_i(w, x, y, i, mu_0, mu, rho):
-    x_i_temp = 1 / m_i * (sum(y[i]))
-
-    c_i[i] = 1 / m_i * (sum(c_ij[i]))
-
-    dual_residual_i = x_i_temp - x[i]
-
-    x[i] = copy.deepcopy(x_i_temp)
-
-    # 计算局部增广拉格朗日函数
-    A_i = 0
-
-    for j in range(m_i):
-        A_i += 0
+    # SCAFFOLD-HC: no augmented Lagrangian penalty terms
+    A_i = 0.0
 
     return A_i, dual_residual_i
 
 
-def analytical_solution_2_cloud_center():
-    w_temp = 1 / n * (sum(x))
+def analytical_solution_cloud():
+    """
+    Cloud-level aggregation for SCAFFOLD-HC.
 
-    dual_residual_i = w_temp - w
+    Computes the global model as the simple average of all fog models:
+        w ← (1 / n) · Σ_i x_i
 
-    w[:] = copy.deepcopy(w_temp)  # 改变外部 w 的内容	修改的是原数组对象的内容
+    Uses the global variables w, x, n (defined in __main__).
 
-    # 计算局部增广拉格朗日函数
-    A_0 = 0
+    Returns:
+        A_0 (float): Placeholder aggregation value (0 in SCAFFOLD-HC).
+        dual_residual (np.ndarray): w_new − w_old.
+    """
+    w_new         = (1 / n) * sum(x)
+    dual_residual = w_new - w
+    w[:]          = copy.deepcopy(w_new)   # in-place update propagates to callers
 
-    for i in range(n):
-        A_0 += 0
+    # SCAFFOLD-HC: no augmented Lagrangian penalty terms
+    A_0 = 0.0
 
-    return A_0, dual_residual_i
+    return A_0, dual_residual
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4.  Inference
+# ──────────────────────────────────────────────────────────────────────────────
 
 def predict(X, w):
-    scores = np.dot(X, w)
-    return np.sign(scores)  # 1 或 -1
+    """
+    Binary prediction using the sign of the linear decision function.
+
+    Args:
+        X (np.ndarray): Feature matrix with bias column, shape (n_samples, p).
+        w (np.ndarray): Weight vector, shape (p,).
+
+    Returns:
+        np.ndarray: Predicted labels in {−1, +1}.
+    """
+    return np.sign(X @ w)
 
 
-if __name__ == '__main__':
-    np.random.seed(seed=42)
+# ──────────────────────────────────────────────────────────────────────────────
+# 5.  Main: SCAFFOLD-HC Training
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # m = X_train_df['Machine_ID'].unique().shape[0]
+if __name__ == "__main__":
+    np.random.seed(42)
 
-    m = 1000
+    # ── Topology ──────────────────────────────────────────────────────────────
+    n   = 10            # number of fog nodes
+    m   = 100          # total edge devices (must be divisible by n)
+    m_i = m // n        # edge devices per fog node
 
-    # 工厂数
-    n = 10
+    # ── Dataset dimensions ────────────────────────────────────────────────────
+    d = X_train.shape[0]   # total training samples
+    p = X_train.shape[1]   # feature dimension (including bias)
 
-    # 单个工厂设备数
-    m_i = int(m / n)
+    # ── Data partitioning ─────────────────────────────────────────────────────
+    # alpha=1.0 → nearly IID; decrease alpha for stronger heterogeneity
+    client_data = split_data(X_train, y_train, num_fog=n, num_edge=m_i, alpha=1.0)
+    print_device_label_distribution(client_data)
 
-    # 总样本数
-    d = X_train.shape[0]
+    total_samples = 0
+    for (fog_key, edge_key), data in client_data.items():
+        n_samples = data["a"].shape[0]
+        print(f"Fog {fog_key}  Edge {edge_key}: {n_samples} samples")
+        total_samples += n_samples
+    print(f"\nTotal samples across all devices: {total_samples}")
 
-    # 总特征数
-    p = X_train.shape[1]
-
-    # 划分数据
-    client_data = split_data(X_train, y_train, num_fog=n, num_edge=m_i, alpha=1)
-
-    # 初始化
+    # ── Data-size weights ─────────────────────────────────────────────────────
+    # Computed for reference; not used in SCAFFOLD-HC aggregation directly
     d_ij = np.zeros((n, m_i), dtype=int)
-
-    # 假设你的 client_data: keys 为 (fog_id, edge_id)
     for (fog_id, edge_id), data in client_data.items():
-        d_ij[fog_id, edge_id] = data['a'].shape[0]  # 或 len(...)
+        d_ij[fog_id, edge_id] = data["a"].shape[0]
 
-    # 工厂数据量
-    d_i = d_ij.sum(axis=1)
+    d_i  = d_ij.sum(axis=1)          # total samples per fog node
+    p_i  = d_i / d                   # fog-level weights  (shape: n,)
+    p_ij = (d_ij.T / d_i).T          # edge-level weights (shape: n × m_i)
 
-    # 权重
-    p_i = d_i / d  # 工厂级权重
-    p_ij = (d_ij.T / d_i).T  # 边缘级权重
+    # ── Primal variable initialisation ────────────────────────────────────────
+    w = np.zeros(p)                                              # global model
+    x = [np.zeros(p) for _ in range(n)]                         # fog models
+    y = [[np.zeros(p) for _ in range(m_i)] for _ in range(n)]   # edge models
 
-    #
-    # print_device_label_distribution(client_data)
+    # ── SCAFFOLD control variate initialisation ───────────────────────────────
+    # c_ij[i][j]: edge control variate, corrects local gradient drift at (i,j)
+    # c_i[i]:     fog control variate, aggregated from edge control variates
+    c_ij = [[np.zeros(p) for _ in range(m_i)] for _ in range(n)]
+    c_i  = [np.zeros(p) for _ in range(n)]
 
-    # client_data = split_data(X_train, y_train, num_fog=n, num_edge=m_i, alpha=0.5)
+    # ── Dual variable initialisation (unused in SCAFFOLD-HC, kept for consistency)
+    mu_0 = [np.zeros(p) for _ in range(n)]                           # cloud-fog multipliers
+    mu   = [[np.zeros(p) for _ in range(m_i)] for _ in range(n)]     # fog-edge multipliers
 
-    # print_device_label_distribution(client_data)
-
-    # total_samples = 0
-    # for (fog_key, edge_key), data in client_data.items():
-    #     X_sub = data['a']
-    #     y_sub = data['b']
-    #     n_samples = X_sub.shape[0]
-    #     print(f"工厂 {fog_key} 设备 {edge_key} 样本数: {n_samples}")
-    #     total_samples += n_samples
-    #
-    # print(f"\n所有设备总样本数: {total_samples}")
-
-    # 初始化参数
-    w = np.zeros(p)  # w
-    x = [np.zeros(p) for i in range(n)]  # x1, x2, x3, x4
-    y = [[np.zeros(p) for j in range(m_i)] for i in range(n)]  # y_ij
-
-    c_ij = [[np.zeros(p) for j in range(m_i)] for i in range(n)]  # c_ij
-    c_i = [np.zeros(p) for i in range(n)]  # c_i
-
-    mu_0 = [np.zeros(p) for i in range(n)]
-
-    mu = [[np.zeros(p) for j in range(m_i)] for i in range(n)]
-
-    dual_residual = {}
-    pri_residual = {}
-
-    F_values = []
-    avg_loss = []
+    # ── Convergence bookkeeping ───────────────────────────────────────────────
+    dual_residual          = {}
+    pri_residual           = {}
+    F_values               = []
+    avg_loss               = []
     avg_accuracies_history = []
-    std_history = []
+    std_history            = []
 
-    eps_pri = 1e-5
-    eps_dual = 1e-5
+    # ── Hyperparameters ───────────────────────────────────────────────────────
+    eps_pri  = 1e-5    # primal residual convergence tolerance
+    eps_dual = 1e-5    # dual residual convergence tolerance
+    v_max    = 1       # inner iterations per outer communication round
+    rho      = 1.0     # penalty parameter (unused in SCAFFOLD-HC, kept for consistency)
+    alpha    = 0.001   # edge gradient-descent step size
+    E        = 10     # local gradient steps per edge update
+    max_iter = 301     # hard cap on total inner iterations
 
-    v_max = 1
+    N_iter = 0         # global iteration counter
 
-    rho = 1.0
-
-    alpha = 0.001  # 梯度下降步长
-
-    E = 500
-
-    max_iter = 301
-
-    N_iter = 0
-
-    logger = logging.getLogger('log')
-
+    # ── Logging setup ─────────────────────────────────────────────────────────
+    logger = logging.getLogger("logger")
     logger.setLevel(logging.DEBUG)
 
-    fh = logging.FileHandler(
-        f'./log/z_logger_SCAFFOLD_E_{E}_rho_{rho}_m_{m}_n_{n}_m_i_{m_i}_v_max_{v_max}_eps_pri_{eps_pri}_eps_dual_{eps_dual}_alpha_{alpha}.log',
-        'w')
-
+    log_path = (
+        f"./log/SCAFFOLD-HC_E{E}_rho{rho}_n{n}_m{m}_mi{m_i}"
+        f"_vmax{v_max}_epspri{eps_pri}_epsdual{eps_dual}_alpha{alpha}.log"
+    )
+    fh = logging.FileHandler(log_path, "w")
     ch = logging.StreamHandler()
 
-    formatter_1 = logging.Formatter(f'%(message)s')
-    formatter_2 = logging.Formatter(f'%(message)s')
-
-    fh.setFormatter(formatter_1)
-    fh.setLevel(logging.DEBUG)
-
-    ch.setFormatter(formatter_2)
-    ch.setLevel(logging.INFO)
-
+    fmt = logging.Formatter("%(message)s")
+    fh.setFormatter(fmt);  fh.setLevel(logging.DEBUG)
+    ch.setFormatter(fmt);  ch.setLevel(logging.INFO)
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-    for k in range(2001):  # 可以根据需要调整迭代次数
-        v = 0
-        while True and (not (v == v_max)):
-            N_iter += 1
-            v += 1
-            F = []
-            loss = []
+    # ── SCAFFOLD-HC main loop ─────────────────────────────────────────────────
+    for k in range(2001):
+        v      = 0
+        temp_1 = 0   # number of dual residuals that have converged
 
+        # Inner loop: run up to v_max local update rounds before aggregation
+        while v < v_max:
+            N_iter += 1
+            v      += 1
+            F, loss = [], []
+
+            # Step 1 – Edge update: variance-corrected gradient descent
+            #          c_ij[i][j] is updated as a side effect inside the solver
             for i in range(n):
                 for j in range(m_i):
-                    F_i_j, avg_loss_i, dual_residual[(i, j)] = logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha,
-                                                                                             rho)
-                    # F_i_j, avg_loss_i, dual_residual[(i, j)] = logistic_third_part_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho)
-                    F.append(F_i_j)
-                    loss.append(avg_loss_i)
+                    F_ij, loss_ij, dual_residual[(i, j)] = \
+                        logistic_grad_solver_edge_i_j(x, y, i, j, mu, d, alpha, rho)
+                    F.append(F_ij)
+                    loss.append(loss_ij)
 
+            # Step 2 – Fog aggregation: average edge models, update c_i[i]
             for i in range(n):
-                F_i, dual_residual[i] = analytical_solution_2_fog_i(w, x, y, i, mu_0, mu, rho)
+                F_i, dual_residual[i] = \
+                    analytical_solution_fog_i(w, x, y, i, mu_0, mu, rho)
                 F.append(F_i)
 
-            F_0, dual_residual[-1] = analytical_solution_2_cloud_center()
+            # Step 3 – Cloud aggregation: simple average of fog models
+            F_0, dual_residual[-1] = analytical_solution_cloud()
             F.append(F_0)
-
-            # print(F_0,dual_residual[-1].shape)
-            # print(w)
 
             F_values.append(sum(F))
             avg_loss.append(sum(loss))
 
-            acc = []
-            for i in range(n):
-                for j in range(m_i):
-                    test_pred = predict(X_test, y[i][j])
-                    test_accuracy = np.mean(test_pred == y_test)
-                    acc.append(test_accuracy)
-            # for i in range(n):
-            #     test_pred = predict(X_test, x[i])
-            #     test_accuracy = np.mean(test_pred == y_test)
-            #     acc.append(test_accuracy)
-            #
-            # test_pred = predict(X_test, w)
-            # test_accuracy = np.mean(test_pred == y_test)
-            # acc.append(test_accuracy)
-
+            # Evaluate per-device test accuracy and compute mean ± std
+            acc = [
+                np.mean(predict(X_test, y[i][j]) == y_test)
+                for i in range(n)
+                for j in range(m_i)
+            ]
             acc_array = np.array(acc)
-            mean_acc = np.mean(acc_array)
-            std_acc = np.std(acc_array)
+            mean_acc  = acc_array.mean()
+            std_acc   = acc_array.std()
             avg_accuracies_history.append(mean_acc)
             std_history.append(std_acc)
 
             logger.info(
-                f"第{k + 1: >2}-{v: >2}({N_iter: >4})次迭代: F_Value: {F_values[-1]},  avg_loss: {avg_loss[-1]}, mean_acc: {mean_acc}, std_acc: {std_acc}")
+                f"Iter {k+1:>3}-{v:>2} ({N_iter:>4}): "
+                f"F={F_values[-1]:.6f}  loss={avg_loss[-1]:.6f}  "
+                f"acc={mean_acc:.4f}±{std_acc:.4f}"
+            )
 
+            # Hard stop if maximum iterations reached
             if N_iter == max_iter:
                 break
 
-            temp_1 = 0
-            for key in dual_residual.keys():
-                # print(np.max(abs(dual_residual[key])))
-                if (abs(dual_residual[key]) <= np.ones(dual_residual[key].shape) * eps_dual).all():
-                    temp_1 += 1
-            # logger.info(f'temp_1 = {temp_1}')
+            # Check dual convergence: count variables below eps_dual
+            temp_1 = sum(
+                1 for key in dual_residual
+                if (np.abs(dual_residual[key]) <= eps_dual).all()
+            )
             if temp_1 == len(dual_residual):
-                logger.info(f'break: temp_1 = {temp_1}')
+                logger.info(f"Dual converged: {temp_1}/{len(dual_residual)} variables below threshold.")
                 break
 
+        # ── Primal residual computation (no multiplier update in SCAFFOLD-HC) ─
         for i in range(n):
             for j in range(m_i):
                 pri_residual[i, j] = x[i] - y[i][j]
-                # mu[i][j] = mu[i][j] + rho * pri_residual[i, j]
+                # mu[i][j] += rho * pri_residual[i, j]   # disabled in SCAFFOLD-HC
 
         for i in range(n):
             pri_residual[i] = w - x[i]
-            # mu_0[i] = mu_0[i] + rho * pri_residual[i]
+            # mu_0[i] += rho * pri_residual[i]           # disabled in SCAFFOLD-HC
 
         if N_iter == max_iter:
             break
 
-        temp_2 = 0
-        for key in pri_residual.keys():
-            if (abs(pri_residual[key]) <= np.ones(pri_residual[key].shape) * eps_pri).all():
-                temp_2 += 1
-        # logger.info(f'temp_2 = {temp_2}')
-
+        # Check primal convergence: count residuals below eps_pri
+        temp_2 = sum(
+            1 for key in pri_residual
+            if (np.abs(pri_residual[key]) <= eps_pri).all()
+        )
         if temp_1 + temp_2 == len(dual_residual) + len(pri_residual):
-            logger.info(f'break: temp_1 + temp_2 = {temp_1 + temp_2}')
+            logger.info(f"Full convergence: dual={temp_1}, primal={temp_2}.")
             break
-    # 计算归一化的损失变化
-    normalized_loss = abs((np.array(avg_loss) - avg_loss[-1])) / avg_loss[-1]
 
-    # 创建 DataFrame
-    df = pd.DataFrame({
-        "F_values": F_values,
-        "Avg_Loss": avg_loss,
+    # ──────────────────────────────────────────────────────────────────────────
+    # 6.  Save Results
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Normalised loss: relative distance from the final loss value
+    normalized_loss = np.abs(np.array(avg_loss) - avg_loss[-1]) / avg_loss[-1]
+
+    results_df = pd.DataFrame({
+        "F_values":        F_values,
+        "Avg_Loss":        avg_loss,
         "Normalized_Loss": normalized_loss,
-        "avg_acc_history": avg_accuracies_history,
-        "std_history": std_history
+        "Mean_Acc":        avg_accuracies_history,
+        "Std_Acc":         std_history,
     })
 
-    # 保存为 csv 文件
-    df.to_csv(
-        f'./csv/data_SCAFFOLD_E_{E}_rho_{rho}_m_{m}_n_{n}_m_i_{m_i}_v_max_{v_max}_iter_{N_iter}_eps_pri_{eps_pri}_eps_dual_{eps_dual}_alpha_{alpha}.csv',
-        index=False)
+    csv_path = (
+        f"./csv/SCAFFOLD-HC_E{E}_rho{rho}_n{n}_m{m}_mi{m_i}"
+        f"_vmax{v_max}_iter{N_iter}_epspri{eps_pri}_epsdual{eps_dual}_alpha{alpha}.csv"
+    )
+    results_df.to_csv(csv_path, index=False)
 
-    logger.info(f'n: {n}')
-    logger.info(f'm_i: {m_i}')
-    logger.info(f'E: {E}')
-    logger.info(f'alpha: {alpha}')
-    logger.info(f'N_iter: {N_iter}')
-    logger.info(f'v_max: {v_max}')
-    logger.info(f'所有客户端的平均准确率: {mean_acc:.8f}')
-    logger.info(f'所有客户端的准确率标准差: {std_acc:.8f}')
-    logger.info(f'w: {w}')
-
-    # for i in range(n):
-    #     for j in range(m_i):
-    #         test_pred = predict(X_test, y[i][j])
-    #         test_accuracy = np.mean(test_pred == y_test)
-    #         logger.info(f'设备{i}-{j}准确率: {test_accuracy}')
-    #
-    # for i in range(n):
-    #     test_pred = predict(X_test, x[i])
-    #     test_accuracy = np.mean(test_pred == y_test)
-    #     logger.info(f'工厂{i}准确率: {test_accuracy}')
-    #
-    # test_pred = predict(X_test, w)
-    # test_accuracy = np.mean(test_pred == y_test)
-    # logger.info(f'cloud center 准确率: {test_accuracy}')
-
-    a = 1
+    # ── Final summary ─────────────────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info(f"Fog nodes (n):              {n}")
+    logger.info(f"Edge devices per fog (m_i): {m_i}")
+    logger.info(f"Local steps (E):            {E}")
+    logger.info(f"Step size (alpha):          {alpha}")
+    logger.info(f"Total iterations:           {N_iter}")
+    logger.info(f"v_max:                      {v_max}")
+    logger.info(f"Mean test accuracy:         {mean_acc:.8f}")
+    logger.info(f"Std  test accuracy:         {std_acc:.8f}")
+    logger.info(f"Global model w:             {w}")
